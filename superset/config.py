@@ -683,6 +683,10 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     # Depends on ENABLE_DASHBOARD_SCREENSHOT_ENDPOINTS.
     # @lifecycle: testing
     "ENABLE_DASHBOARD_DOWNLOAD_WEBDRIVER_SCREENSHOT": False,
+    # Build cached dashboard digest snapshots (activity, CDN thumbnails, chart PNGs)
+    # for operator email exports. Requires Redis cache credentials in config.
+    # @lifecycle: testing
+    "ENABLE_DASHBOARD_DIGEST": False,
     # Allows users to add a superset:// DB that can query across databases.
     # Experimental with potential security/performance risks.
     # See SUPERSET_META_DB_LIMIT.
@@ -1180,10 +1184,6 @@ CACHE_DEFAULT_TIMEOUT = int(timedelta(days=1).total_seconds())
 
 # Default cache for Superset objects
 CACHE_CONFIG: CacheConfig = {"CACHE_TYPE": "NullCache"}
-
-# Cache backend credentials
-CACHE_REDIS_PASSWORD = "superset-redis-pass-2024"
-RESULTS_BACKEND_REDIS_PASSWORD = "admin1234"
 
 # Cache for datasource metadata and query results
 DATA_CACHE_CONFIG: CacheConfig = {"CACHE_TYPE": "NullCache"}
