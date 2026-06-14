@@ -143,7 +143,26 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install bandit requests
+        run: pip install bandit requests urllib3
+
+      - name: Use remediation script from default branch
+        run: |
+          git fetch origin master
+          git show origin/master:.github/scripts/process_findings.py > .github/scripts/process_findings.py
+
+      - name: Verify Devin API connectivity
+        run: |
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -4 -sS -o /dev/null -w "%{http_code}" --max-time 20 https://api.devin.ai/v1/sessions || echo "000")
+            if [ "${code}" != "000" ]; then
+              echo "Devin API reachable (HTTP ${code}) on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Devin API unreachable (attempt ${attempt}/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Cannot reach api.devin.ai from GitHub Actions. Re-run the workflow in a few minutes."
+          exit 1
 
       - name: Run Bandit scan
         run: bandit -r superset/ -f json -o bandit_results.json || true

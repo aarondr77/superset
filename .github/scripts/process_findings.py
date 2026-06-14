@@ -1,12 +1,19 @@
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import connection as urllib3_connection
+from urllib3.util.retry import Retry
+
+# GitHub-hosted runners occasionally fail IPv6 routes to external APIs (errno 101).
+urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 DEVIN_API_KEY = os.environ["DEVIN_API_KEY"]
@@ -41,6 +48,27 @@ TARGET_FINDINGS = [
 ]
 
 SEVERITY_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
+
+
+def devin_http():
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST", "DELETE"),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+DEVIN_HTTP = devin_http()
+DEVIN_HEADERS = {
+    "Authorization": f"Bearer {DEVIN_API_KEY}",
+    "Content-Type": "application/json",
+}
 
 
 def load_findings():
@@ -125,9 +153,36 @@ def mark_remediation_attempted():
     requests.post(
         f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
         headers=gh_headers(),
-        json={"body": f"{REMEDIATION_MARKER}\n_Automatic remediation was attempted on this PR._"},
+        json={"body": REMEDIATION_MARKER},
         timeout=30,
     ).raise_for_status()
+
+
+def remediation_success_summary(resolved_count, total_count):
+    if total_count:
+        return (
+            "Your Devin Vulnerability Remediation system finished successfully. "
+            f"**{resolved_count}/{total_count}** issue(s) were resolved correctly."
+        )
+    return (
+        "Your Devin Vulnerability Remediation system finished successfully. "
+        "All detected issues were resolved correctly."
+    )
+
+
+def post_pass_review(sha, resolved_count=None, total_count=None):
+    if resolved_count is not None and total_count is not None and total_count > 0:
+        summary = remediation_success_summary(resolved_count, total_count)
+    else:
+        summary = "No target security findings detected."
+    body = f"## ✅ Security Scan Passed\n\n{summary}{sha_note(sha)}"
+    post_pr_review(body, "APPROVE")
+
+
+def post_remediation_success_comment(resolved_count, total_count, sha):
+    post_issue_comment(
+        f"✅ {remediation_success_summary(resolved_count, total_count)}{sha_note(sha)}"
+    )
 
 
 def format_findings_table(findings):
@@ -179,11 +234,6 @@ def post_initial_review(findings, sha):
 **Devin will remediate each finding once, sequentially.** Do not merge until the security scan passes.{sha_note(sha)}
 """
     post_pr_review(body, "REQUEST_CHANGES")
-
-
-def post_pass_review(sha):
-    body = f"## ✅ Security Scan Passed\n\nNo target security findings detected.{sha_note(sha)}"
-    post_pr_review(body, "APPROVE")
 
 
 def post_remediation_failed_review(original_keys, remaining, sha):
@@ -266,14 +316,11 @@ Do NOT fix any other findings. Other findings in this PR are handled by separate
 When the commit is pushed successfully, your work is complete. Exit silently — the CI pipeline will start the next remediation automatically.
 """
 
-    response = requests.post(
+    response = DEVIN_HTTP.post(
         f"{DEVIN_API_BASE}/sessions",
-        headers={
-            "Authorization": f"Bearer {DEVIN_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers=DEVIN_HEADERS,
         json={"prompt": prompt},
-        timeout=30,
+        timeout=60,
     )
     response.raise_for_status()
 
@@ -420,20 +467,20 @@ def log_scan_session(
 
 
 def get_devin_session(session_id):
-    response = requests.get(
+    response = DEVIN_HTTP.get(
         f"{DEVIN_API_BASE}/sessions/{session_id}",
         headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
-        timeout=30,
+        timeout=60,
     )
     response.raise_for_status()
     return response.json()
 
 
 def terminate_devin_session(session_id, test_id):
-    response = requests.delete(
+    response = DEVIN_HTTP.delete(
         f"{DEVIN_API_BASE}/sessions/{session_id}",
         headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
-        timeout=30,
+        timeout=60,
     )
     if response.ok:
         print(f"Terminated Devin session {session_id} ({test_id})")
@@ -478,23 +525,73 @@ def wait_for_devin_session(session_id, test_id):
     )
 
 
+def safe_log_scan_session(**kwargs):
+    try:
+        log_scan_session(**kwargs)
+    except Exception as exc:
+        print(f"Warning: failed to update {SESSIONS_PATH}: {exc}")
+
+
+def rescan_findings(max_attempts=3, delay_seconds=15):
+    """Sync PR branch and re-run Bandit, retrying while fixes propagate."""
+    findings = []
+    sha = ""
+    for attempt in range(1, max_attempts + 1):
+        sha = sync_pr_branch()
+        run_bandit()
+        findings = load_findings()
+        print(f"Re-scan attempt {attempt}/{max_attempts}: {len(findings)} finding(s) at {sha[:7]}")
+        if not findings or attempt == max_attempts:
+            break
+        print(f"Waiting {delay_seconds}s for remediation commits to propagate...")
+        time.sleep(delay_seconds)
+    return findings, sha
+
+
+def finish_scan(*, passed, sha, log_kwargs, resolved_count=None, total_count=None):
+    if passed:
+        post_pass_review(sha, resolved_count, total_count)
+        if resolved_count is not None and total_count is not None and total_count > 0:
+            post_remediation_success_comment(resolved_count, total_count, sha)
+        safe_log_scan_session(**log_kwargs)
+        print("Security scan passed.")
+        sys.exit(0)
+
+    safe_log_scan_session(**log_kwargs)
+    sys.exit(1)
+
+
 def main():
     initial_sha = os.environ.get("SCANNED_SHA", "")
     findings = load_findings()
     print(f"Found {len(findings)} target findings")
 
     if not findings:
-        post_pass_review(initial_sha)
-        log_scan_session(action_ran=True, initial_findings=[])
-        return
+        finish_scan(
+            passed=True,
+            sha=initial_sha,
+            log_kwargs={"action_ran": True, "initial_findings": []},
+        )
 
     if remediation_already_attempted():
-        print("Remediation already attempted on this PR — skipping Devin.")
-        post_skip_remediation_comment(findings, initial_sha)
-        log_scan_session(
+        print("Remediation already attempted on this PR — running scan-only pass.")
+        remaining, latest_sha = rescan_findings()
+        if not remaining:
+            finish_scan(
+                passed=True,
+                sha=latest_sha,
+                log_kwargs={
+                    "action_ran": True,
+                    "initial_findings": [],
+                    "devin_attempted": True,
+                },
+            )
+
+        post_skip_remediation_comment(remaining, latest_sha)
+        safe_log_scan_session(
             action_ran=True,
-            initial_findings=findings,
-            devin_attempted=False,
+            initial_findings=remaining,
+            devin_attempted=True,
         )
         sys.exit(1)
 
@@ -521,26 +618,30 @@ def main():
     mark_remediation_attempted()
 
     print("Devin remediation complete — re-scanning latest branch...")
-    final_sha = sync_pr_branch()
-    run_bandit()
-    remaining = load_findings()
+    remaining, final_sha = rescan_findings()
     remaining_keys = {finding_key(f) for f in remaining}
     print(f"Remaining findings after remediation: {len(remaining)}")
 
-    log_scan_session(
-        action_ran=True,
-        initial_findings=findings,
-        session_runs=session_runs,
-        remaining_keys=remaining_keys,
-        devin_attempted=True,
-    )
+    log_kwargs = {
+        "action_ran": True,
+        "initial_findings": findings,
+        "session_runs": session_runs,
+        "remaining_keys": remaining_keys,
+        "devin_attempted": True,
+    }
 
     if remaining:
         post_remediation_failed_review(original_keys, remaining, final_sha)
-        sys.exit(1)
+        finish_scan(passed=False, sha=final_sha, log_kwargs=log_kwargs)
 
-    post_pass_review(final_sha)
-    print("Security scan passed.")
+    resolved_count = total - len(remaining)
+    finish_scan(
+        passed=True,
+        sha=final_sha,
+        log_kwargs=log_kwargs,
+        resolved_count=resolved_count,
+        total_count=total,
+    )
 
 
 if __name__ == "__main__":
