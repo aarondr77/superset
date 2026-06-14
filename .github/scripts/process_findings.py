@@ -11,12 +11,12 @@ DEVIN_API_KEY = os.environ["DEVIN_API_KEY"]
 PR_NUMBER = os.environ["PR_NUMBER"]
 REPO = os.environ["REPO"]
 BRANCH = os.environ["BRANCH"]
-SCANNED_SHA = os.environ.get("SCANNED_SHA", "")
 
 DEVIN_API_BASE = "https://api.devin.ai/v1"
 DEVIN_POLL_INTERVAL_SECONDS = int(os.environ.get("DEVIN_POLL_INTERVAL_SECONDS", "30"))
 DEVIN_SESSION_TIMEOUT_SECONDS = int(os.environ.get("DEVIN_SESSION_TIMEOUT_SECONDS", "3600"))
 DEVIN_TERMINAL_STATUSES = {"blocked", "finished"}
+REMEDIATION_MARKER = "<!-- security-scan-devin-attempted -->"
 
 # Your 5 injected findings — filter to these for the demo
 TARGET_FINDINGS = [
@@ -46,6 +46,14 @@ def load_findings():
     return results
 
 
+def finding_key(finding):
+    return (
+        finding["test_id"],
+        finding["filename"].replace("./", ""),
+        finding["line_number"],
+    )
+
+
 def get_git_blame(filepath, line_number):
     try:
         result = subprocess.run(
@@ -62,46 +70,143 @@ def get_git_blame(filepath, line_number):
     return "Unknown"
 
 
-def post_pr_review(findings):
-    """Post a single structured review comment listing all findings."""
-    sha_note = f"\n\n_Scanned commit: `{SCANNED_SHA[:7]}`_" if SCANNED_SHA else ""
+def run_bandit():
+    subprocess.run(
+        ["bandit", "-r", "superset/", "-f", "json", "-o", "bandit_results.json"],
+        check=False,
+    )
 
-    if not findings:
-        body = f"## ✅ Security Scan Passed\n\nNo target security findings detected.{sha_note}"
-        event = "APPROVE"
-    else:
-        rows = []
-        for f in findings:
-            filepath = f["filename"].replace("./", "")
-            author = get_git_blame(filepath, f["line_number"])
-            emoji = SEVERITY_EMOJI.get(f["issue_severity"], "⚪")
-            rows.append(
-                f"| {emoji} {f['issue_severity']} | `{f['test_id']}` | "
-                f"`{filepath}:{f['line_number']}` | {f['issue_text'][:60]} | {author} |"
-            )
 
-        table = "\n".join(rows)
-        body = f"""## 🔒 Security Scan — {len(findings)} Finding(s) Detected
+def sync_pr_branch():
+    subprocess.run(["git", "fetch", "origin", BRANCH], check=True)
+    subprocess.run(["git", "checkout", "-B", BRANCH, f"origin/{BRANCH}"], check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    sha = head.stdout.strip()
+    print(f"Synced to origin/{BRANCH} at {sha}")
+    return sha
 
-| Severity | Rule | Location | Description | Introduced By |
-|----------|------|----------|-------------|---------------|
-{table}
 
-**Devin is now remediating each finding sequentially.** This PR will be updated with fixes one at a time. Do not merge until the security scan passes on the latest commit.{sha_note}
-"""
-        event = "REQUEST_CHANGES"
+def gh_headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
 
+
+def remediation_already_attempted():
+    response = requests.get(
+        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+        headers=gh_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return any(REMEDIATION_MARKER in (c.get("body") or "") for c in response.json())
+
+
+def mark_remediation_attempted():
+    requests.post(
+        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+        headers=gh_headers(),
+        json={"body": f"{REMEDIATION_MARKER}\n_Automatic remediation was attempted on this PR._"},
+        timeout=30,
+    ).raise_for_status()
+
+
+def format_findings_table(findings):
+    rows = []
+    for f in findings:
+        filepath = f["filename"].replace("./", "")
+        author = get_git_blame(filepath, f["line_number"])
+        emoji = SEVERITY_EMOJI.get(f["issue_severity"], "⚪")
+        rows.append(
+            f"| {emoji} {f['issue_severity']} | `{f['test_id']}` | "
+            f"`{filepath}:{f['line_number']}` | {f['issue_text'][:60]} | {author} |"
+        )
+    return "\n".join(rows)
+
+
+def post_pr_review(body, event):
     response = requests.post(
         f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}/reviews",
-        headers={
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json",
-        },
+        headers=gh_headers(),
         json={"body": body, "event": event},
         timeout=30,
     )
     response.raise_for_status()
     print(f"Posted PR review: {event}")
+
+
+def post_issue_comment(body):
+    response = requests.post(
+        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+        headers=gh_headers(),
+        json={"body": body},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def sha_note(sha):
+    return f"\n\n_Scanned commit: `{sha[:7]}`_" if sha else ""
+
+
+def post_initial_review(findings, sha):
+    table = format_findings_table(findings)
+    body = f"""## 🔒 Security Scan — {len(findings)} Finding(s) Detected
+
+| Severity | Rule | Location | Description | Introduced By |
+|----------|------|----------|-------------|---------------|
+{table}
+
+**Devin will remediate each finding once, sequentially.** Do not merge until the security scan passes.{sha_note(sha)}
+"""
+    post_pr_review(body, "REQUEST_CHANGES")
+
+
+def post_pass_review(sha):
+    body = f"## ✅ Security Scan Passed\n\nNo target security findings detected.{sha_note(sha)}"
+    post_pr_review(body, "APPROVE")
+
+
+def post_remediation_failed_review(original_keys, remaining, sha):
+    table = format_findings_table(remaining)
+    persisted = [k for k in map(finding_key, remaining) if k in original_keys]
+    persisted_rules = ", ".join(sorted({k[0] for k in persisted})) or "n/a"
+
+    body = f"""## ⚠️ Security Scan — Remediation Incomplete
+
+Devin attempted to fix the findings below, but a follow-up Bandit scan still reports **{len(remaining)}** issue(s).
+
+| Severity | Rule | Location | Description | Introduced By |
+|----------|------|----------|-------------|---------------|
+{table}
+
+**No further automatic remediation will be run on this PR.** Rules still failing include: {persisted_rules}.
+
+Please fix the remaining issues manually, then tag `@devin-error-detector` again to re-run the scan only.{sha_note(sha)}
+"""
+    post_pr_review(body, "REQUEST_CHANGES")
+
+
+def post_skip_remediation_comment(findings, sha):
+    table = format_findings_table(findings)
+    post_issue_comment(
+        f"""## ⚠️ Security Scan — Automatic Remediation Skipped
+
+Findings were detected, but automatic remediation **already ran once** on this PR and will not be retried.
+
+| Severity | Rule | Location | Description | Introduced By |
+|----------|------|----------|-------------|---------------|
+{table}
+
+Fix the remaining issues manually, then tag `@devin-error-detector` to re-run the scan.{sha_note(sha)}
+"""
+    )
 
 
 def trigger_devin_session(finding, index, total):
@@ -154,14 +259,12 @@ This is remediation **{index} of {total}** in a sequential batch. Earlier fixes 
     )
     response.raise_for_status()
 
-    session = response.json()
-    session_id = session.get("session_id")
+    session_id = response.json().get("session_id")
     print(f"Devin session started for {finding['test_id']}: {session_id}")
     return session_id
 
 
 def wait_for_devin_session(session_id, test_id):
-    """Block until Devin finishes so the next fix starts from an up-to-date branch."""
     headers = {"Authorization": f"Bearer {DEVIN_API_KEY}"}
     deadline = time.monotonic() + DEVIN_SESSION_TIMEOUT_SECONDS
 
@@ -172,8 +275,7 @@ def wait_for_devin_session(session_id, test_id):
             timeout=30,
         )
         response.raise_for_status()
-        status = response.json()
-        status_enum = status.get("status_enum", "unknown")
+        status_enum = response.json().get("status_enum", "unknown")
         print(f"Devin session {session_id} ({test_id}) status: {status_enum}")
 
         if status_enum in DEVIN_TERMINAL_STATUSES:
@@ -181,7 +283,7 @@ def wait_for_devin_session(session_id, test_id):
                 raise RuntimeError(
                     f"Devin session {session_id} for {test_id} is blocked and needs attention"
                 )
-            return status
+            return
 
         time.sleep(DEVIN_POLL_INTERVAL_SECONDS)
 
@@ -192,24 +294,43 @@ def wait_for_devin_session(session_id, test_id):
 
 
 def main():
+    initial_sha = os.environ.get("SCANNED_SHA", "")
     findings = load_findings()
     print(f"Found {len(findings)} target findings")
 
-    post_pr_review(findings)
+    if not findings:
+        post_pass_review(initial_sha)
+        return
+
+    if remediation_already_attempted():
+        print("Remediation already attempted on this PR — skipping Devin.")
+        post_skip_remediation_comment(findings, initial_sha)
+        sys.exit(1)
+
+    original_keys = {finding_key(f) for f in findings}
+    post_initial_review(findings, initial_sha)
 
     total = len(findings)
     for index, finding in enumerate(findings, start=1):
         session_id = trigger_devin_session(finding, index, total)
-        if session_id:
-            wait_for_devin_session(session_id, finding["test_id"])
-            print(f"Completed remediation {index}/{total} for {finding['test_id']}")
-        else:
+        if not session_id:
             raise RuntimeError(f"Devin did not return a session_id for {finding['test_id']}")
+        wait_for_devin_session(session_id, finding["test_id"])
+        print(f"Completed remediation {index}/{total} for {finding['test_id']}")
 
-    if findings:
-        print("Security findings detected — re-run this workflow after Devin remediates.")
+    mark_remediation_attempted()
+
+    print("Devin remediation complete — re-scanning latest branch...")
+    final_sha = sync_pr_branch()
+    run_bandit()
+    remaining = load_findings()
+    print(f"Remaining findings after remediation: {len(remaining)}")
+
+    if remaining:
+        post_remediation_failed_review(original_keys, remaining, final_sha)
         sys.exit(1)
 
+    post_pass_review(final_sha)
     print("Security scan passed.")
 
 

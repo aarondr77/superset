@@ -117,6 +117,8 @@ jobs:
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
           fetch-depth: 0
+          token: ${{ github.token }}
+          persist-credentials: true
 
       - name: Verify scan targets latest PR commit
         env:
@@ -155,17 +157,3 @@ jobs:
           BRANCH: ${{ steps.pr.outputs.branch }}
           SCANNED_SHA: ${{ steps.pr.outputs.head_sha }}
         run: python .github/scripts/process_findings.py
-
-      - name: Re-verify PR head has not moved during scan
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          PR_NUMBER="${{ steps.pr.outputs.number }}"
-          SCANNED_SHA="${{ steps.pr.outputs.head_sha }}"
-          LATEST_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
-
-          if [ "${LATEST_SHA}" != "${SCANNED_SHA}" ]; then
-            echo "::error::New commits were pushed while the scan was running."
-            echo "::error::Re-run the security scan on the latest commit (${LATEST_SHA:0:7})."
-            exit 1
-          fi
