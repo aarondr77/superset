@@ -419,17 +419,47 @@ def log_scan_session(
     push_sessions_log(record)
 
 
+def get_devin_session(session_id):
+    response = requests.get(
+        f"{DEVIN_API_BASE}/sessions/{session_id}",
+        headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def terminate_devin_session(session_id, test_id):
+    response = requests.delete(
+        f"{DEVIN_API_BASE}/sessions/{session_id}",
+        headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
+        timeout=30,
+    )
+    if response.ok:
+        print(f"Terminated Devin session {session_id} ({test_id})")
+    else:
+        print(
+            f"Could not terminate session {session_id} ({test_id}): "
+            f"{response.status_code} {response.text[:200]}"
+        )
+
+
 def wait_for_devin_session(session_id, test_id):
+    """Poll until Devin stops working.
+
+    v1 status_enum values (see Devin API docs):
+    - working: actively running
+    - blocked: idle, awaiting user input ("Devin is awaiting instructions" in UI)
+    - finished: task complete
+
+    For one-shot remediation, blocked after a push is success — Devin finished
+    and is waiting for the next message. Do not treat it as an error.
+    """
     deadline = time.monotonic() + DEVIN_SESSION_TIMEOUT_SECONDS
 
     while time.monotonic() < deadline:
-        response = requests.get(
-            f"{DEVIN_API_BASE}/sessions/{session_id}",
-            headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        status_enum = response.json().get("status_enum", "unknown")
+        session = get_devin_session(session_id)
+        status_enum = session.get("status_enum") or "unknown"
         print(f"Devin session {session_id} ({test_id}) status: {status_enum}")
 
         if status_enum in DEVIN_TERMINAL_STATUSES:
@@ -437,6 +467,7 @@ def wait_for_devin_session(session_id, test_id):
                 f"Devin session {session_id} ({test_id}) ended with {status_enum}. "
                 "Continuing to next finding."
             )
+            terminate_devin_session(session_id, test_id)
             return utc_now()
 
         time.sleep(DEVIN_POLL_INTERVAL_SECONDS)
