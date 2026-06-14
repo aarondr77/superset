@@ -1,8 +1,10 @@
+import base64
 import json
 import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -11,12 +13,23 @@ DEVIN_API_KEY = os.environ["DEVIN_API_KEY"]
 PR_NUMBER = os.environ["PR_NUMBER"]
 REPO = os.environ["REPO"]
 BRANCH = os.environ["BRANCH"]
-SCANNED_SHA = os.environ.get("SCANNED_SHA", "")
 
 DEVIN_API_BASE = "https://api.devin.ai/v1"
 DEVIN_POLL_INTERVAL_SECONDS = int(os.environ.get("DEVIN_POLL_INTERVAL_SECONDS", "30"))
 DEVIN_SESSION_TIMEOUT_SECONDS = int(os.environ.get("DEVIN_SESSION_TIMEOUT_SECONDS", "3600"))
 DEVIN_TERMINAL_STATUSES = {"blocked", "finished"}
+REMEDIATION_MARKER = "<!-- security-scan-devin-attempted -->"
+SESSIONS_PATH = "devin-sessions.json"
+DEFAULT_BRANCH = os.environ.get("DEFAULT_BRANCH", "master")
+
+CONTRIBUTOR_DIRECTORY = {
+    "mia-chen": ("mia.chen", "mia.chen@airbnb.com", "jake.rubin@airbnb.com", True),
+    "alex-kim": ("alex.kim", "alex.kim@airbnb.com", "jake.rubin@airbnb.com", True),
+    "jordan-lee": ("jordan.lee", "jordan.lee@airbnb.com", "maria.santos@airbnb.com", True),
+    "sam-patel": ("sam.patel", "sam.patel@airbnb.com", "lisa.wong@airbnb.com", False),
+    "taylor-ng": ("taylor.ng", "taylor.ng@airbnb.com", "lisa.wong@airbnb.com", False),
+    "aarondr77": ("aarond.rubin", "aarondr77@users.noreply.github.com", "jake.rubin@airbnb.com", True),
+}
 
 # Your 5 injected findings — filter to these for the demo
 TARGET_FINDINGS = [
@@ -46,6 +59,14 @@ def load_findings():
     return results
 
 
+def finding_key(finding):
+    return (
+        finding["test_id"],
+        finding["filename"].replace("./", ""),
+        finding["line_number"],
+    )
+
+
 def get_git_blame(filepath, line_number):
     try:
         result = subprocess.run(
@@ -62,41 +83,70 @@ def get_git_blame(filepath, line_number):
     return "Unknown"
 
 
-def post_pr_review(findings):
-    """Post a single structured review comment listing all findings."""
-    sha_note = f"\n\n_Scanned commit: `{SCANNED_SHA[:7]}`_" if SCANNED_SHA else ""
+def run_bandit():
+    subprocess.run(
+        ["bandit", "-r", "superset/", "-f", "json", "-o", "bandit_results.json"],
+        check=False,
+    )
 
-    if not findings:
-        body = f"## ✅ Security Scan Passed\n\nNo target security findings detected.{sha_note}"
-        event = "APPROVE"
-    else:
-        rows = []
-        for f in findings:
-            filepath = f["filename"].replace("./", "")
-            author = get_git_blame(filepath, f["line_number"])
-            emoji = SEVERITY_EMOJI.get(f["issue_severity"], "⚪")
-            rows.append(
-                f"| {emoji} {f['issue_severity']} | `{f['test_id']}` | "
-                f"`{filepath}:{f['line_number']}` | {f['issue_text'][:60]} | {author} |"
-            )
 
-        table = "\n".join(rows)
-        body = f"""## 🔒 Security Scan — {len(findings)} Finding(s) Detected
+def sync_pr_branch():
+    subprocess.run(["git", "fetch", "origin", BRANCH], check=True)
+    subprocess.run(["git", "checkout", "-B", BRANCH, f"origin/{BRANCH}"], check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    sha = head.stdout.strip()
+    print(f"Synced to origin/{BRANCH} at {sha}")
+    return sha
 
-| Severity | Rule | Location | Description | Introduced By |
-|----------|------|----------|-------------|---------------|
-{table}
 
-**Devin is now remediating each finding sequentially.** This PR will be updated with fixes one at a time. Do not merge until the security scan passes on the latest commit.{sha_note}
-"""
-        event = "REQUEST_CHANGES"
+def gh_headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
 
+
+def remediation_already_attempted():
+    response = requests.get(
+        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+        headers=gh_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return any(REMEDIATION_MARKER in (c.get("body") or "") for c in response.json())
+
+
+def mark_remediation_attempted():
+    requests.post(
+        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+        headers=gh_headers(),
+        json={"body": f"{REMEDIATION_MARKER}\n_Automatic remediation was attempted on this PR._"},
+        timeout=30,
+    ).raise_for_status()
+
+
+def format_findings_table(findings):
+    rows = []
+    for f in findings:
+        filepath = f["filename"].replace("./", "")
+        author = get_git_blame(filepath, f["line_number"])
+        emoji = SEVERITY_EMOJI.get(f["issue_severity"], "⚪")
+        rows.append(
+            f"| {emoji} {f['issue_severity']} | `{f['test_id']}` | "
+            f"`{filepath}:{f['line_number']}` | {f['issue_text'][:60]} | {author} |"
+        )
+    return "\n".join(rows)
+
+
+def post_pr_review(body, event):
     response = requests.post(
         f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}/reviews",
-        headers={
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json",
-        },
+        headers=gh_headers(),
         json={"body": body, "event": event},
         timeout=30,
     )
@@ -104,23 +154,94 @@ def post_pr_review(findings):
     print(f"Posted PR review: {event}")
 
 
+def post_issue_comment(body):
+    response = requests.post(
+        f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+        headers=gh_headers(),
+        json={"body": body},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def sha_note(sha):
+    return f"\n\n_Scanned commit: `{sha[:7]}`_" if sha else ""
+
+
+def post_initial_review(findings, sha):
+    table = format_findings_table(findings)
+    body = f"""## 🔒 Security Scan — {len(findings)} Finding(s) Detected
+
+| Severity | Rule | Location | Description | Introduced By |
+|----------|------|----------|-------------|---------------|
+{table}
+
+**Devin will remediate each finding once, sequentially.** Do not merge until the security scan passes.{sha_note(sha)}
+"""
+    post_pr_review(body, "REQUEST_CHANGES")
+
+
+def post_pass_review(sha):
+    body = f"## ✅ Security Scan Passed\n\nNo target security findings detected.{sha_note(sha)}"
+    post_pr_review(body, "APPROVE")
+
+
+def post_remediation_failed_review(original_keys, remaining, sha):
+    table = format_findings_table(remaining)
+    persisted = [k for k in map(finding_key, remaining) if k in original_keys]
+    persisted_rules = ", ".join(sorted({k[0] for k in persisted})) or "n/a"
+
+    body = f"""## ⚠️ Security Scan — Remediation Incomplete
+
+Devin attempted to fix the findings below, but a follow-up Bandit scan still reports **{len(remaining)}** issue(s).
+
+| Severity | Rule | Location | Description | Introduced By |
+|----------|------|----------|-------------|---------------|
+{table}
+
+**No further automatic remediation will be run on this PR.** Rules still failing include: {persisted_rules}.
+
+Please fix the remaining issues manually, then tag `@devin-error-detector` again to re-run the scan only.{sha_note(sha)}
+"""
+    post_pr_review(body, "REQUEST_CHANGES")
+
+
+def post_skip_remediation_comment(findings, sha):
+    table = format_findings_table(findings)
+    post_issue_comment(
+        f"""## ⚠️ Security Scan — Automatic Remediation Skipped
+
+Findings were detected, but automatic remediation **already ran once** on this PR and will not be retried.
+
+| Severity | Rule | Location | Description | Introduced By |
+|----------|------|----------|-------------|---------------|
+{table}
+
+Fix the remaining issues manually, then tag `@devin-error-detector` to re-run the scan.{sha_note(sha)}
+"""
+    )
+
+
 def trigger_devin_session(finding, index, total):
     filepath = finding["filename"].replace("./", "")
     code_snippet = finding.get("code", "").strip()
 
-    prompt = f"""You are working on a pull request in a fork of Apache Superset.
+    prompt = f"""You are an automated security remediation agent working on a pull request in a fork of Apache Superset.
 
-## Your Task
-Fix a security vulnerability that was detected by an automated scan on this PR.
-Commit your fix directly to the branch `{BRANCH}` in the repository `https://github.com/{REPO}`.
-
-This is remediation **{index} of {total}** in a sequential batch. Earlier fixes may already be on the branch — always sync before editing.
-
-## Vulnerability Details
+## Scope — one finding only
+Fix **exactly one** vulnerability in this session:
 - **Rule:** {finding["test_id"]}
-- **Severity:** {finding["issue_severity"]}
 - **File:** `{filepath}`
 - **Line:** {finding["line_number"]}
+
+Do NOT fix any other findings. Other findings in this PR are handled by separate automated sessions after you finish.
+
+## Repository
+- Repo: `https://github.com/{REPO}`
+- Branch: `{BRANCH}`
+
+## Vulnerability Details
+- **Severity:** {finding["issue_severity"]}
 - **Description:** {finding["issue_text"]}
 
 ## Vulnerable Code
@@ -128,19 +249,21 @@ This is remediation **{index} of {total}** in a sequential batch. Earlier fixes 
 {code_snippet}
 ```
 
-## Instructions
+## Steps
 1. Clone or update the repo and run `git pull origin {BRANCH}` before making changes
-2. Navigate to `{filepath}` at line {finding["line_number"]}
-3. Fix the vulnerability described above
-4. Verify that running `bandit -r {filepath}` no longer reports {finding["test_id"]} on this code
-5. Commit the fix to branch `{BRANCH}` with message: `fix: remediate {finding["test_id"]} in {filepath}`
-6. Push to `{BRANCH}` and do not open a new PR
+2. Fix only `{finding["test_id"]}` at `{filepath}:{finding["line_number"]}`
+3. Verify `bandit -r {filepath}` no longer reports `{finding["test_id"]}` on that line
+4. Commit with message: `fix: remediate {finding["test_id"]} in {filepath}`
+5. Push to `{BRANCH}`
 
-## Acceptance Criteria
-- [ ] Branch is up to date with `origin/{BRANCH}` before edits
-- [ ] {finding["test_id"]} no longer fires on the fixed code
-- [ ] Function signatures and behavior are unchanged
-- [ ] Fix is committed and pushed to branch `{BRANCH}`
+## Critical rules
+1. Never ask questions. Never ask for user confirmation. Never wait for user messages.
+2. After the fix is pushed, **stop immediately**. Do not summarize other findings or offer next steps.
+3. Do your best with the information provided. Push the fix and stop.
+4. Do not open a new PR.
+
+## Done means done
+When the commit is pushed successfully, your work is complete. Exit silently — the CI pipeline will start the next remediation automatically.
 """
 
     response = requests.post(
@@ -154,34 +277,198 @@ This is remediation **{index} of {total}** in a sequential batch. Earlier fixes 
     )
     response.raise_for_status()
 
-    session = response.json()
-    session_id = session.get("session_id")
+    session_id = response.json().get("session_id")
     print(f"Devin session started for {finding['test_id']}: {session_id}")
     return session_id
 
 
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def minutes_between(start_iso, end_iso):
+    if not start_iso or not end_iso:
+        return None
+    start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    return round((end - start).total_seconds() / 60)
+
+
+def fetch_pr_metadata():
+    response = requests.get(
+        f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}",
+        headers=gh_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    pr = response.json()
+    login = pr["user"]["login"]
+    if login in CONTRIBUTOR_DIRECTORY:
+        author, email, manager, is_engineer = CONTRIBUTOR_DIRECTORY[login]
+    else:
+        author = login
+        email = pr["user"].get("email") or f"{login}@users.noreply.github.com"
+        manager = "unknown@airbnb.com"
+        is_engineer = True
+
+    return {
+        "pr_url": pr["html_url"],
+        "merged": pr.get("merged_at") is not None,
+        "pr_author": author,
+        "pr_author_email": email,
+        "pr_author_manager": manager,
+        "pr_author_is_engineer": is_engineer,
+    }
+
+
+def build_finding_record(finding, session_run=None, fixed=None):
+    filepath = finding["filename"].replace("./", "")
+    record = {
+        "rule": finding["test_id"],
+        "severity": finding["issue_severity"],
+        "file": filepath,
+        "line": finding["line_number"],
+        "devin_session_id": None,
+        "devin_started_at": None,
+        "devin_completed_at": None,
+        "fixed": fixed,
+        "fix_time_mins": None,
+    }
+    if session_run:
+        record["devin_session_id"] = session_run["session_id"]
+        record["devin_started_at"] = session_run["started_at"]
+        record["devin_completed_at"] = session_run["completed_at"]
+        record["fixed"] = fixed
+        record["fix_time_mins"] = minutes_between(
+            session_run["started_at"], session_run["completed_at"]
+        )
+    return record
+
+
+def push_sessions_log(record):
+    owner, repo = REPO.split("/", 1)
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{SESSIONS_PATH}"
+    response = requests.get(
+        url,
+        headers=gh_headers(),
+        params={"ref": DEFAULT_BRANCH},
+        timeout=30,
+    )
+
+    file_sha = None
+    if response.status_code == 200:
+        existing = json.loads(base64.b64decode(response.json()["content"]))
+        file_sha = response.json()["sha"]
+    elif response.status_code == 404:
+        existing = []
+    else:
+        response.raise_for_status()
+        existing = []
+
+    existing.append(record)
+    payload = {
+        "message": f"chore: log devin sessions for PR #{PR_NUMBER}",
+        "content": base64.b64encode(json.dumps(existing, indent=2).encode()).decode(),
+        "branch": DEFAULT_BRANCH,
+    }
+    if file_sha:
+        payload["sha"] = file_sha
+
+    put_response = requests.put(url, headers=gh_headers(), json=payload, timeout=30)
+    put_response.raise_for_status()
+    print(f"Updated {SESSIONS_PATH} on {DEFAULT_BRANCH}")
+
+
+def log_scan_session(
+    *,
+    action_ran,
+    initial_findings,
+    session_runs=None,
+    remaining_keys=None,
+    devin_attempted=False,
+):
+    metadata = fetch_pr_metadata()
+    remaining_keys = remaining_keys or set()
+    session_runs = session_runs or {}
+
+    finding_records = []
+    for finding in initial_findings:
+        key = finding_key(finding)
+        session_run = session_runs.get(key)
+        fixed = None
+        if devin_attempted:
+            fixed = key not in remaining_keys if session_run else False
+        finding_records.append(
+            build_finding_record(finding, session_run=session_run, fixed=fixed)
+        )
+
+    record = {
+        "pr_number": int(PR_NUMBER),
+        "pr_url": metadata["pr_url"],
+        "date": utc_now(),
+        "action_ran": action_ran,
+        "merged": metadata["merged"],
+        **{k: metadata[k] for k in (
+            "pr_author",
+            "pr_author_email",
+            "pr_author_manager",
+            "pr_author_is_engineer",
+        )},
+        "findings": finding_records,
+    }
+    push_sessions_log(record)
+
+
+def get_devin_session(session_id):
+    response = requests.get(
+        f"{DEVIN_API_BASE}/sessions/{session_id}",
+        headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def terminate_devin_session(session_id, test_id):
+    response = requests.delete(
+        f"{DEVIN_API_BASE}/sessions/{session_id}",
+        headers={"Authorization": f"Bearer {DEVIN_API_KEY}"},
+        timeout=30,
+    )
+    if response.ok:
+        print(f"Terminated Devin session {session_id} ({test_id})")
+    else:
+        print(
+            f"Could not terminate session {session_id} ({test_id}): "
+            f"{response.status_code} {response.text[:200]}"
+        )
+
+
 def wait_for_devin_session(session_id, test_id):
-    """Block until Devin finishes so the next fix starts from an up-to-date branch."""
-    headers = {"Authorization": f"Bearer {DEVIN_API_KEY}"}
+    """Poll until Devin stops working.
+
+    v1 status_enum values (see Devin API docs):
+    - working: actively running
+    - blocked: idle, awaiting user input ("Devin is awaiting instructions" in UI)
+    - finished: task complete
+
+    For one-shot remediation, blocked after a push is success — Devin finished
+    and is waiting for the next message. Do not treat it as an error.
+    """
     deadline = time.monotonic() + DEVIN_SESSION_TIMEOUT_SECONDS
 
     while time.monotonic() < deadline:
-        response = requests.get(
-            f"{DEVIN_API_BASE}/sessions/{session_id}",
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        status = response.json()
-        status_enum = status.get("status_enum", "unknown")
+        session = get_devin_session(session_id)
+        status_enum = session.get("status_enum") or "unknown"
         print(f"Devin session {session_id} ({test_id}) status: {status_enum}")
 
         if status_enum in DEVIN_TERMINAL_STATUSES:
-            if status_enum == "blocked":
-                raise RuntimeError(
-                    f"Devin session {session_id} for {test_id} is blocked and needs attention"
-                )
-            return status
+            print(
+                f"Devin session {session_id} ({test_id}) ended with {status_enum}. "
+                "Continuing to next finding."
+            )
+            terminate_devin_session(session_id, test_id)
+            return utc_now()
 
         time.sleep(DEVIN_POLL_INTERVAL_SECONDS)
 
@@ -192,24 +479,67 @@ def wait_for_devin_session(session_id, test_id):
 
 
 def main():
+    initial_sha = os.environ.get("SCANNED_SHA", "")
     findings = load_findings()
     print(f"Found {len(findings)} target findings")
 
-    post_pr_review(findings)
+    if not findings:
+        post_pass_review(initial_sha)
+        log_scan_session(action_ran=True, initial_findings=[])
+        return
 
-    total = len(findings)
-    for index, finding in enumerate(findings, start=1):
-        session_id = trigger_devin_session(finding, index, total)
-        if session_id:
-            wait_for_devin_session(session_id, finding["test_id"])
-            print(f"Completed remediation {index}/{total} for {finding['test_id']}")
-        else:
-            raise RuntimeError(f"Devin did not return a session_id for {finding['test_id']}")
-
-    if findings:
-        print("Security findings detected — re-run this workflow after Devin remediates.")
+    if remediation_already_attempted():
+        print("Remediation already attempted on this PR — skipping Devin.")
+        post_skip_remediation_comment(findings, initial_sha)
+        log_scan_session(
+            action_ran=True,
+            initial_findings=findings,
+            devin_attempted=False,
+        )
         sys.exit(1)
 
+    original_keys = {finding_key(f) for f in findings}
+    post_initial_review(findings, initial_sha)
+
+    session_runs = {}
+    total = len(findings)
+    for index, finding in enumerate(findings, start=1):
+        if index > 1:
+            sync_pr_branch()
+        started_at = utc_now()
+        session_id = trigger_devin_session(finding, index, total)
+        if not session_id:
+            raise RuntimeError(f"Devin did not return a session_id for {finding['test_id']}")
+        completed_at = wait_for_devin_session(session_id, finding["test_id"])
+        session_runs[finding_key(finding)] = {
+            "session_id": session_id,
+            "started_at": started_at,
+            "completed_at": completed_at,
+        }
+        print(f"Completed remediation {index}/{total} for {finding['test_id']}")
+
+    mark_remediation_attempted()
+
+    print("Devin remediation complete — re-scanning latest branch...")
+    final_sha = sync_pr_branch()
+    run_bandit()
+    remaining = load_findings()
+    remaining_keys = {finding_key(f) for f in remaining}
+    print(f"Remaining findings after remediation: {len(remaining)}")
+
+    log_scan_session(
+        action_ran=True,
+        initial_findings=findings,
+        session_runs=session_runs,
+        remaining_keys=remaining_keys,
+        devin_attempted=True,
+    )
+
+    if remaining:
+        post_remediation_failed_review(original_keys, remaining, final_sha)
+        sys.exit(1)
+
+    post_pass_review(final_sha)
     print("Security scan passed.")
 
 
