@@ -21,7 +21,6 @@ from pytest_mock import MockerFixture
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.session import Session
-
 from superset.connectors.sqla.models import (
     SqlaTable,
     TableColumn,
