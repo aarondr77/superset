@@ -26,23 +26,24 @@ jobs:
               `https://github.com/${owner}/${repo}/actions/workflows/security-scan.yml` +
               `?query=branch:${encodeURIComponent(branch)}`;
 
-            const body = `${marker}
-## Security scan required before merge
-
-This PR must pass a security scan on the **latest commit** (\`${shortSha}\`) before it can be merged.
-
-### Run scan
-
-[![Run Security Scan](https://img.shields.io/badge/Run-Security%20Scan-0366d6?style=for-the-badge&logo=githubactions&logoColor=white)](${workflowUrl})
-
-1. Click **Run Security Scan** above
-2. Press **Run workflow**
-3. Select branch \`${branch}\`, then **Run workflow**
-
-Or comment \`/run-security-scan\` on this PR to start the scan automatically.
-
-> **Note:** Each new push invalidates the previous scan. Re-run after your latest commit before merging.
-`;
+            const body = [
+              marker,
+              '## Security scan required before merge',
+              '',
+              `This PR must pass a security scan on the **latest commit** (\`${shortSha}\`) before it can be merged.`,
+              '',
+              '### Run scan',
+              '',
+              `[![Run Security Scan](https://img.shields.io/badge/Run-Security%20Scan-0366d6?style=for-the-badge&logo=githubactions&logoColor=white)](${workflowUrl})`,
+              '',
+              '1. Click **Run Security Scan** above',
+              '2. Press **Run workflow**',
+              `3. Select branch \`${branch}\`, then **Run workflow**`,
+              '',
+              'Or comment `/run-security-scan` on this PR to start the scan automatically.',
+              '',
+              '> **Note:** Each new push invalidates the previous scan. Re-run after your latest commit before merging.',
+            ].join('\n');
 
             const { data: comments } = await github.rest.issues.listComments({
               owner,
