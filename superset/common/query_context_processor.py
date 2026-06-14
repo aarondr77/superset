@@ -21,7 +21,7 @@ import re
 from typing import Any, cast, ClassVar, Sequence, TYPE_CHECKING
 
 import pandas as pd
-from flask import current_app
+from flask import current_app, g
 from flask_babel import gettext as _
 
 from superset.common.chart_data import ChartDataResultFormat
@@ -46,11 +46,13 @@ from superset.utils.core import (
     DatasourceType,
     DTTM_ALIAS,
     error_msg_from_exception,
+    FilterOperator,
     GenericDataType,
     get_column_names_from_columns,
     get_column_names_from_metrics,
     is_adhoc_column,
     is_adhoc_metric,
+    simple_filter_to_adhoc,
 )
 from superset.utils.pandas_postprocessing.utils import unescape_separator
 from superset.views.utils import get_viz
@@ -79,11 +81,55 @@ class QueryContextProcessor:
     cache_type: ClassVar[str] = "df"
     enforce_numerical_metrics: ClassVar[bool] = True
 
+    def _prepare_runtime_request_context(self, query_obj: QueryObject) -> None:
+        """
+        Normalize per-request state before cache lookup and template execution.
+
+        Chart/data is the canonical entry point for dashboard queries. Materialize
+        query filters into ``g.form_data`` here so Jinja macros and cache key logic
+        share the same prepared context instead of re-deriving it downstream.
+        """
+        form_data = self._query_context.form_data
+        if not form_data:
+            return
+
+        g.form_data = form_data
+        adhoc_filters = form_data.get("adhoc_filters")
+        if not adhoc_filters or not query_obj.filter:
+            return
+
+        def filter_key(subject: str, operator: str) -> str:
+            return f"{subject}__{operator.upper()}"
+
+        existing = {
+            filter_key(cast(str, flt.get("subject")), cast(str, flt.get("operator", "")))
+            for flt in adhoc_filters
+            if flt.get("expressionType") == "SIMPLE" and flt.get("subject")
+        }
+
+        for flt in query_obj.filter:
+            col = flt.get("col")
+            if not col:
+                continue
+            op = (flt.get("op") or FilterOperator.IN).upper()
+            val = flt.get("val")
+            if val is None and op not in (
+                FilterOperator.IS_NULL,
+                FilterOperator.IS_NOT_NULL,
+                "IS NULL",
+                "IS NOT NULL",
+            ):
+                continue
+            if filter_key(col, op) in existing:
+                continue
+            adhoc_filters.append(simple_filter_to_adhoc(flt))
+
     def get_df_payload(
         self, query_obj: QueryObject, force_cached: bool | None = False
     ) -> dict[str, Any]:
         """Handles caching around the df payload retrieval"""
         if query_obj:
+            self._prepare_runtime_request_context(query_obj)
             # Always validate the query object before generating cache key
             # This ensures sanitize_clause() is called and extras are normalized
             query_obj.validate()

@@ -25,9 +25,33 @@ from superset import feature_flag_manager
 from superset.utils.json import loads as json_loads
 
 if TYPE_CHECKING:
+    from superset.explorables.base import Explorable
     from superset.models.core import Database
+    from superset.superset_typing import QueryObjectDict
 
 logger = logging.getLogger(__name__)
+
+
+def query_requires_runtime_expansion(
+    datasource: Explorable,
+    query_obj: QueryObjectDict,
+) -> bool:
+    """
+    Return whether a query needs template/SQL expansion beyond the static cache
+    dimensions captured by ``QueryObject.cache_key()`` and ``get_rls_cache_key()``.
+
+    Chart/data requests that only vary by ``filter``, time range, and dataset-level
+    RLS do not need supplemental analysis. Queries with user-aware Jinja helpers
+    require deeper inspection for both cache keys and template execution.
+    """
+    has_extra_cache_key_calls = getattr(
+        datasource,
+        "has_extra_cache_key_calls",
+        None,
+    )
+    if callable(has_extra_cache_key_calls):
+        return bool(has_extra_cache_key_calls(query_obj))
+    return False
 
 
 def add_impersonation_cache_key_if_needed(

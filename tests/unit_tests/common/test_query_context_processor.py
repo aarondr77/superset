@@ -1855,3 +1855,53 @@ def test_raise_for_access_evaluates_access_before_validate():
             processor.raise_for_access()
 
     query.validate.assert_not_called()
+
+
+def test_prepare_runtime_request_context_materializes_filters(app) -> None:
+    from flask import g
+
+    from superset.common.query_object import QueryObject
+
+    mock_query_context = MagicMock()
+    mock_query_context.form_data = {
+        "adhoc_filters": [
+            {
+                "clause": "WHERE",
+                "comparator": ["west"],
+                "expressionType": "SIMPLE",
+                "operator": "in",
+                "subject": "region",
+            }
+        ]
+    }
+    mock_query_context.datasource = MagicMock()
+
+    processor = QueryContextProcessor(mock_query_context)
+    query_obj = QueryObject(
+        filter=[{"col": "name", "op": "IN", "val": ["drill_val"]}],
+    )
+
+    with app.test_request_context():
+        processor._prepare_runtime_request_context(query_obj)
+
+    assert g.form_data is mock_query_context.form_data
+    assert len(mock_query_context.form_data["adhoc_filters"]) == 2
+    assert mock_query_context.form_data["adhoc_filters"][1]["subject"] == "name"
+
+
+def test_prepare_runtime_request_context_skips_without_adhoc_baseline(app) -> None:
+    from superset.common.query_object import QueryObject
+
+    mock_query_context = MagicMock()
+    mock_query_context.form_data = {}
+    mock_query_context.datasource = MagicMock()
+
+    processor = QueryContextProcessor(mock_query_context)
+    query_obj = QueryObject(
+        filter=[{"col": "name", "op": "IN", "val": ["drill_val"]}],
+    )
+
+    with app.test_request_context():
+        processor._prepare_runtime_request_context(query_obj)
+
+    assert "adhoc_filters" not in mock_query_context.form_data

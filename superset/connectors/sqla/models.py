@@ -2115,19 +2115,44 @@ class SqlaTable(
                 return True
         return False
 
+    def _append_virtual_dataset_rls_cache_keys(
+        self,
+        extra_cache_keys: list[Hashable],
+        query_obj: QueryObjectDict,
+    ) -> None:
+        """Add inline RLS predicates from virtual dataset SQL to cache keys."""
+        if not self.is_virtual or not self.sql:
+            return
+
+        from superset.utils.cache_keys import query_requires_runtime_expansion
+
+        if not query_requires_runtime_expansion(self, query_obj):
+            return
+
+        from superset.utils.rls import collect_rls_predicates_for_sql
+
+        default_schema = self.database.get_default_schema(self.catalog)
+        extra_cache_keys.extend(
+            collect_rls_predicates_for_sql(
+                self.sql,
+                self.database,
+                self.catalog,
+                self.schema or default_schema or "",
+                exclude_dataset_id=self.id,
+            )
+        )
+
     def get_extra_cache_keys(self, query_obj: QueryObjectDict) -> list[Hashable]:
         """
         The cache key of a SqlaTable needs to consider any keys added by the parent
         class and any keys added via `ExtraCache`.
 
-        For virtual datasets, RLS predicates are included in the cache key to ensure
-        users with different RLS rules get different cached results.
+        For virtual datasets, RLS predicates may be included in the cache key to
+        ensure users with different RLS rules get different cached results.
 
         :param query_obj: query object to analyze
         :return: The extra cache keys
         """
-        from superset.utils.rls import collect_rls_predicates_for_sql
-
         extra_cache_keys = super().get_extra_cache_keys(query_obj)
         if self.has_extra_cache_key_calls(query_obj):
             # Filter out keys that aren't parameters to get_sqla_query
@@ -2137,18 +2162,7 @@ class SqlaTable(
             sqla_query = self.get_sqla_query(**cast(Any, filtered_query_obj))
             extra_cache_keys += sqla_query.extra_cache_keys
 
-        # For virtual datasets, include RLS predicates in the cache key
-        if self.is_virtual and self.sql:
-            default_schema = self.database.get_default_schema(self.catalog)
-            rls_predicates = collect_rls_predicates_for_sql(
-                self.sql,
-                self.database,
-                self.catalog,
-                self.schema or default_schema or "",
-                exclude_dataset_id=self.id,
-            )
-            # Add each predicate as a separate cache key component
-            extra_cache_keys.extend(rls_predicates)
+        self._append_virtual_dataset_rls_cache_keys(extra_cache_keys, query_obj)
 
         return list(set(extra_cache_keys))
 

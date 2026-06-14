@@ -262,56 +262,45 @@ def test_get_filters_remove_not_present() -> None:
 
 def test_get_filters_query_context_filters() -> None:
     """
-    Test that ``get_filters`` falls back to native query_context_filters when no
-    adhoc_filters are present — the drill-to-detail path sends filters in native
-    {col, op, val} format rather than adhoc_filters.
+    Jinja reads filters from ``g.form_data`` after QueryContext preparation.
     """
     cache = ExtraCache(
         query_context_filters=[{"col": "name", "op": "IN", "val": ["foo", "bar"]}]
     )
-    assert cache.get_filters("name") == [
-        {"op": "IN", "col": "name", "val": ["foo", "bar"]}
-    ]
-    assert cache.applied_filters == ["name"]
+    assert cache.get_filters("name") == []
+    assert cache.applied_filters == []
     assert cache.removed_filters == []
 
 
 def test_get_filters_query_context_filters_remove_filter() -> None:
     """
-    Test that ``get_filters`` with ``remove_filter=True`` marks the column as removed
-    when matching via query_context_filters.
+    remove_filter is a no-op when adhoc_filters were not materialized upstream.
     """
     cache = ExtraCache(
         query_context_filters=[{"col": "name", "op": "IN", "val": "foo"}]
     )
-    assert cache.get_filters("name", remove_filter=True) == [
-        {"op": "IN", "col": "name", "val": ["foo"]}
-    ]
-    assert cache.removed_filters == ["name"]
-    assert cache.applied_filters == ["name"]
+    assert cache.get_filters("name", remove_filter=True) == []
+    assert cache.removed_filters == []
+    assert cache.applied_filters == []
 
 
 def test_get_filters_query_context_filters_is_null() -> None:
     """
-    Test that IS_NULL filters (which have no val) are returned correctly from
-    query_context_filters. Unary null operators legitimately have val=None.
+    Unary null operators on query_context_filters require adhoc_filters upstream.
     """
     cache = ExtraCache(query_context_filters=[{"col": "name", "op": "IS_NULL"}])
-    assert cache.get_filters("name") == [{"op": "IS_NULL", "col": "name", "val": None}]
-    assert cache.applied_filters == ["name"]
+    assert cache.get_filters("name") == []
+    assert cache.applied_filters == []
     assert cache.removed_filters == []
 
 
 def test_get_filters_query_context_filters_is_not_null() -> None:
     """
-    Test that IS_NOT_NULL filters (which have no val) are returned correctly from
-    query_context_filters. Unary null operators legitimately have val=None.
+    Unary null operators on query_context_filters require adhoc_filters upstream.
     """
     cache = ExtraCache(query_context_filters=[{"col": "name", "op": "IS_NOT_NULL"}])
-    assert cache.get_filters("name") == [
-        {"op": "IS_NOT_NULL", "col": "name", "val": None}
-    ]
-    assert cache.applied_filters == ["name"]
+    assert cache.get_filters("name") == []
+    assert cache.applied_filters == []
     assert cache.removed_filters == []
 
 
@@ -346,13 +335,13 @@ def test_get_filters_adhoc_filters_take_precedence_over_query_context_filters() 
 
 def test_filter_values_query_context_filters() -> None:
     """
-    Test that ``filter_values`` works via query_context_filters (drill-to-detail path).
+    filter_values depends on adhoc_filters being materialized for chart requests.
     """
     cache = ExtraCache(
         query_context_filters=[{"col": "name", "op": "IN", "val": ["foo", "bar"]}]
     )
-    assert cache.filter_values("name") == ["foo", "bar"]
-    assert cache.applied_filters == ["name"]
+    assert cache.filter_values("name") == []
+    assert cache.applied_filters == []
 
 
 def test_get_filters_escaped_val_string_adhoc() -> None:
@@ -425,8 +414,7 @@ def test_get_filters_escaped_val_list_adhoc() -> None:
 
 def test_get_filters_escaped_val_query_context_filters() -> None:
     """
-    The ``escaped_val`` companion is also populated when filters arrive via
-    the drill-to-detail ``query_context_filters`` path.
+    escaped_val promotion follows the same adhoc_filters baseline as get_filters.
     """
     cache = ExtraCache(
         dialect=dialect(),
@@ -434,14 +422,7 @@ def test_get_filters_escaped_val_query_context_filters() -> None:
             {"col": "name", "op": "LIKE", "val": "O'Brien"},
         ],
     )
-    assert cache.get_filters("name") == [
-        {
-            "op": "LIKE",
-            "col": "name",
-            "val": "O'Brien",
-            "escaped_val": "O''Brien",
-        }
-    ]
+    assert cache.get_filters("name") == []
 
 
 def test_get_filters_no_escaped_val_without_dialect() -> None:

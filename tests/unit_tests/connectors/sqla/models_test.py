@@ -1208,3 +1208,68 @@ def test_validate_stored_expression_rejects_subquery_around_jinja(
             None,
             "(SELECT password FROM ab_user LIMIT 1) {# x #}",
         )
+
+
+def test_virtual_dataset_rls_cache_keys_skip_static_sql(
+    mocker: MockerFixture,
+) -> None:
+    """
+    Static virtual dataset SQL should not require runtime cache expansion.
+    """
+    sqla_table = SqlaTable(
+        id=10,
+        table_name="orders_virtual",
+        sql="SELECT * FROM orders WHERE region = 'west'",
+        columns=[],
+        metrics=[],
+        database=mocker.MagicMock(),
+    )
+    sqla_table.database.get_default_schema.return_value = "public"
+    mocker.patch(
+        "superset.utils.cache_keys.query_requires_runtime_expansion",
+        return_value=False,
+    )
+    collect = mocker.patch(
+        "superset.utils.rls.collect_rls_predicates_for_sql",
+        return_value=["tenant_id = '1'"],
+    )
+
+    keys = sqla_table.get_extra_cache_keys({})
+
+    collect.assert_not_called()
+    assert "tenant_id = '1'" not in keys
+
+
+def test_virtual_dataset_rls_cache_keys_with_user_aware_jinja(
+    mocker: MockerFixture,
+) -> None:
+    """
+    User-aware Jinja still requires runtime cache expansion for virtual datasets.
+    """
+    sqla_table = SqlaTable(
+        id=11,
+        table_name="orders_virtual",
+        sql="SELECT * FROM orders WHERE owner = '{{ current_user_id() }}'",
+        columns=[],
+        metrics=[],
+        database=mocker.MagicMock(),
+    )
+    sqla_table.database.get_default_schema.return_value = "public"
+    mocker.patch(
+        "superset.utils.cache_keys.query_requires_runtime_expansion",
+        return_value=True,
+    )
+    mocker.patch.object(
+        sqla_table,
+        "get_sqla_query",
+        return_value=mocker.MagicMock(extra_cache_keys=[]),
+    )
+    collect = mocker.patch(
+        "superset.utils.rls.collect_rls_predicates_for_sql",
+        return_value=["tenant_id = '1'"],
+    )
+
+    keys = sqla_table.get_extra_cache_keys({})
+
+    collect.assert_called_once()
+    assert "tenant_id = '1'" in keys
