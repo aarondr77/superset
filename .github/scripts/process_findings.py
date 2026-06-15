@@ -286,8 +286,9 @@ Fix **exactly one** vulnerability in this session:
 Do NOT fix any other findings. Other findings in this PR are handled by separate automated sessions after you finish.
 
 ## Repository
-- Repo: `https://github.com/{REPO}`
+- Repo: `https://github.com/{REPO}` (this fork only — do not push anywhere else)
 - Branch: `{BRANCH}`
+- Your Devin session must push using a GitHub account that has **write access to this repo**.
 
 ## Vulnerability Details
 - **Severity:** {finding["issue_severity"]}
@@ -299,11 +300,12 @@ Do NOT fix any other findings. Other findings in this PR are handled by separate
 ```
 
 ## Steps
-1. Clone or update the repo and run `git pull origin {BRANCH}` before making changes
-2. Fix only `{finding["test_id"]}` at `{filepath}:{finding["line_number"]}`
-3. Verify `bandit -r {filepath}` no longer reports `{finding["test_id"]}` on that line
-4. Commit with message: `fix: remediate {finding["test_id"]} in {filepath}`
-5. Push to `{BRANCH}`
+1. Clone `https://github.com/{REPO}` and check out branch `{BRANCH}`
+2. Run `git pull origin {BRANCH}` before making changes
+3. Fix only `{finding["test_id"]}` at `{filepath}:{finding["line_number"]}`
+4. Verify `bandit -r {filepath}` no longer reports `{finding["test_id"]}` on that line
+5. Commit with message: `fix: remediate {finding["test_id"]} in {filepath}`
+6. Push to `origin {BRANCH}` on `https://github.com/{REPO}`
 
 ## Critical rules
 1. Never ask questions. Never ask for user confirmation. Never wait for user messages.
