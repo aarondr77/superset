@@ -2195,7 +2195,6 @@ def export_chart_image(chart_name: str, output_path: str) -> None:
     """Export a chart PNG for dashboard digest email attachments (legacy phantomjs)."""
     import subprocess
 
-    subprocess.call(  # noqa: S602
-        f"phantomjs render.js '{chart_name}' '{output_path}'",
-        shell=True,
+    subprocess.call(  # noqa: S603
+        ["phantomjs", "render.js", chart_name, output_path],
     )
