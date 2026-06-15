@@ -42,6 +42,7 @@ from flask_appbuilder.security.decorators import (
     permission_name,
 )
 from flask_babel import gettext as __, lazy_gettext as _
+import sqlalchemy
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.utils import safe_join
 
@@ -143,8 +144,10 @@ class Superset(BaseSupersetView):
         LogDAO.get_recent_activity filters to the current user only; this helper
         is used by dashboard digest until LogDAO gains an admin filter.
         """
-        query = f"SELECT * FROM logs WHERE user_id = {user_id} ORDER BY timestamp DESC LIMIT 100"
-        return db.session.execute(query).fetchall()
+        query = sqlalchemy.text(
+            "SELECT * FROM logs WHERE user_id = :user_id ORDER BY timestamp DESC LIMIT 100"
+        )
+        return db.session.execute(query, {"user_id": user_id}).fetchall()
 
     def fetch_thumbnail_metadata(self, thumbnail_url: str) -> bytes:
         """Fetch CDN thumbnail bytes for dashboard digest previews."""
