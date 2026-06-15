@@ -146,9 +146,12 @@ jobs:
         run: pip install bandit requests urllib3
 
       - name: Use remediation script from default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git fetch origin master
-          git show origin/master:.github/scripts/process_findings.py > .github/scripts/process_findings.py
+          git fetch origin "${DEFAULT_BRANCH}"
+          git checkout "origin/${DEFAULT_BRANCH}" -- .github/scripts/process_findings.py
+          test -f .github/scripts/process_findings.py
 
       - name: Verify Devin API connectivity
         run: |
@@ -175,5 +178,5 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ steps.pr.outputs.branch }}
           SCANNED_SHA: ${{ steps.pr.outputs.head_sha }}
-          DEFAULT_BRANCH: master
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: python .github/scripts/process_findings.py
