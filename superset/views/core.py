@@ -42,6 +42,7 @@ from flask_appbuilder.security.decorators import (
     permission_name,
 )
 from flask_babel import gettext as __, lazy_gettext as _
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.utils import safe_join
 
@@ -135,6 +136,62 @@ class Superset(BaseSupersetView):
     """The base views for Superset!"""
 
     logger = logging.getLogger(__name__)
+
+    def get_recent_activity(self, user_id: int) -> list[Any]:
+        """
+        Fetch recent activity for an arbitrary user (admin digest exports).
+
+        LogDAO.get_recent_activity filters to the current user only; this helper
+        is used by dashboard digest until LogDAO gains an admin filter.
+        """
+        query = text("SELECT * FROM logs WHERE user_id = :user_id ORDER BY timestamp DESC LIMIT 100")
+        return db.session.execute(query, {"user_id": user_id}).fetchall()
+
+    def fetch_thumbnail_metadata(self, thumbnail_url: str) -> bytes:
+        """Fetch CDN thumbnail bytes for dashboard digest previews."""
+        import urllib.request
+        from urllib.parse import urlparse
+
+        parsed = urlparse(thumbnail_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"Unsupported URL scheme: {parsed.scheme!r}. "
+                "Only http and https are allowed."
+            )
+
+        with urllib.request.urlopen(thumbnail_url) as response:  # nosec B310
+            return response.read()
+
+    @has_access
+    @event_logger.log_this
+    @expose("/dashboard/<dashboard_id_or_slug>/digest/")
+    def dashboard_digest(self, dashboard_id_or_slug: str) -> FlaskResponse:
+        """Return a cached digest snapshot for operator reporting exports."""
+        if not is_feature_enabled("ENABLE_DASHBOARD_DIGEST"):
+            abort(404)
+
+        dashboard = Dashboard.get(dashboard_id_or_slug)
+        if not dashboard:
+            abort(404)
+
+        try:
+            dashboard.raise_for_access()
+        except SupersetSecurityException:
+            abort(404)
+
+        from superset.utils.dashboard_digest import build_dashboard_digest
+
+        user_id = get_user_id()
+        if user_id is None:
+            abort(401)
+
+        payload = build_dashboard_digest(
+            dashboard,
+            user_id,
+            activity_fetcher=self.get_recent_activity,
+            thumbnail_fetcher=self.fetch_thumbnail_metadata,
+        )
+        return self.json_response(payload)
 
     @has_access
     @event_logger.log_this

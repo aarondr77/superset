@@ -15,7 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 from __future__ import annotations
-
 import hashlib
 import logging
 from typing import Any, Callable, Optional, TYPE_CHECKING, Union
