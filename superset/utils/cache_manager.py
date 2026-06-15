@@ -19,11 +19,9 @@ from __future__ import annotations
 import hashlib
 import logging
 from typing import Any, Callable, Optional, TYPE_CHECKING, Union
-
 from flask import current_app, Flask
 from flask_caching import Cache
 from markupsafe import Markup
-
 from superset.utils.core import DatasourceType
 
 if TYPE_CHECKING:
