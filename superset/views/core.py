@@ -152,8 +152,15 @@ class Superset(BaseSupersetView):
     def fetch_thumbnail_metadata(self, thumbnail_url: str) -> bytes:
         """Fetch CDN thumbnail bytes for dashboard digest previews."""
         import urllib.request
+        from urllib.parse import urlparse
 
-        with urllib.request.urlopen(thumbnail_url) as response:  # noqa: S310
+        parsed = urlparse(thumbnail_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"Invalid URL scheme '{parsed.scheme}'. Only http and https are allowed."
+            )
+
+        with urllib.request.urlopen(thumbnail_url) as response:  # nosec B310
             return response.read()
 
     @has_access
