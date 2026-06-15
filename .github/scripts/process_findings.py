@@ -30,12 +30,12 @@ SESSIONS_PATH = "devin-sessions.json"
 DEFAULT_BRANCH = os.environ.get("DEFAULT_BRANCH", "master")
 
 CONTRIBUTOR_DIRECTORY = {
+    "aarondr77": ("Aaron.DiamondReivch", "aarondr77@users.noreply.github.com", "jake.jordan@airbnb.com", True),
     "mia-chen": ("mia.chen", "mia.chen@airbnb.com", "jake.rubin@airbnb.com", True),
     "alex-kim": ("alex.kim", "alex.kim@airbnb.com", "jake.rubin@airbnb.com", True),
     "jordan-lee": ("jordan.lee", "jordan.lee@airbnb.com", "maria.santos@airbnb.com", True),
     "sam-patel": ("sam.patel", "sam.patel@airbnb.com", "lisa.wong@airbnb.com", False),
     "taylor-ng": ("taylor.ng", "taylor.ng@airbnb.com", "lisa.wong@airbnb.com", False),
-    "aarondr77": ("aarond.rubin", "aarondr77@users.noreply.github.com", "jake.rubin@airbnb.com", True),
 }
 
 # Your 5 injected findings — filter to these for the demo
