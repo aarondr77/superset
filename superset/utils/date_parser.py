@@ -57,7 +57,6 @@ ParserElement.enable_packrat()
 # DEBUG. Suppress the library's own logger to WARNING; real failures still
 # surface, just not the per-call chatter.
 logging.getLogger("parsedatetime").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 # Mapping of ordinal words to their numeric values for date expressions
