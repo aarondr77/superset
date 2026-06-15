@@ -26,6 +26,7 @@ DEVIN_POLL_INTERVAL_SECONDS = int(os.environ.get("DEVIN_POLL_INTERVAL_SECONDS", 
 DEVIN_SESSION_TIMEOUT_SECONDS = int(os.environ.get("DEVIN_SESSION_TIMEOUT_SECONDS", "3600"))
 DEVIN_TERMINAL_STATUSES = {"blocked", "finished"}
 REMEDIATION_MARKER = "<!-- security-scan-devin-attempted -->"
+CHECK_NAME = "security-scan"
 SESSIONS_PATH = "devin-sessions.json"
 DEFAULT_BRANCH = os.environ.get("DEFAULT_BRANCH", "master")
 
@@ -174,7 +175,7 @@ def post_pass_review(sha, resolved_count=None, total_count=None):
     else:
         summary = "No target security findings detected."
     body = f"## ✅ Security Scan Passed\n\n{summary}{sha_note(sha)}"
-    post_pr_review(body, "APPROVE")
+    post_pr_review(body, "APPROVE", commit_id=sha)
 
 
 def post_remediation_success_comment(resolved_count, total_count, sha):
@@ -197,15 +198,51 @@ def format_findings_table(findings):
     return "\n".join(rows)
 
 
-def post_pr_review(body, event):
+def post_pr_review(body, event, commit_id=None):
+    payload = {"body": body, "event": event}
+    if commit_id:
+        payload["commit_id"] = commit_id
     response = requests.post(
         f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}/reviews",
         headers=gh_headers(),
-        json={"body": body, "event": event},
+        json=payload,
+        timeout=30,
+    )
+    if not response.ok and event == "APPROVE" and response.status_code in (403, 422):
+        print(
+            f"Could not APPROVE review ({response.status_code}); "
+            "posting COMMENT on latest commit instead"
+        )
+        post_pr_review(body, "COMMENT", commit_id=commit_id)
+        return
+    response.raise_for_status()
+    print(f"Posted PR review: {event}")
+
+
+def post_security_scan_check(sha, *, passed, description):
+    """Report the required branch-protection check on the scanned commit.
+
+    Workflow job checks are tied to the trigger commit. Devin pushes fix commits
+    during remediation, so we must publish security-scan on the final PR head.
+    """
+    if not sha:
+        print(f"Warning: no SHA available for {CHECK_NAME} check")
+        return
+    conclusion = "success" if passed else "failure"
+    response = requests.post(
+        f"https://api.github.com/repos/{REPO}/check-runs",
+        headers={**gh_headers(), "Accept": "application/vnd.github+json"},
+        json={
+            "name": CHECK_NAME,
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": conclusion,
+            "output": {"title": CHECK_NAME, "summary": description},
+        },
         timeout=30,
     )
     response.raise_for_status()
-    print(f"Posted PR review: {event}")
+    print(f"Posted {CHECK_NAME} check ({conclusion}) on {sha[:7]}")
 
 
 def post_issue_comment(body):
@@ -232,7 +269,7 @@ def post_initial_review(findings, sha):
 
 **Devin will remediate each finding once, sequentially.** Do not merge until the security scan passes.{sha_note(sha)}
 """
-    post_pr_review(body, "REQUEST_CHANGES")
+    post_pr_review(body, "REQUEST_CHANGES", commit_id=sha)
 
 
 def post_remediation_failed_review(original_keys, remaining, sha):
@@ -252,7 +289,7 @@ Devin attempted to fix the findings below, but a follow-up Bandit scan still rep
 
 Please fix the remaining issues manually, then tag `@devin-error-detector` again to re-run the scan only.{sha_note(sha)}
 """
-    post_pr_review(body, "REQUEST_CHANGES")
+    post_pr_review(body, "REQUEST_CHANGES", commit_id=sha)
 
 
 def post_skip_remediation_comment(findings, sha):
@@ -549,7 +586,23 @@ def rescan_findings(max_attempts=3, delay_seconds=15):
     return findings, sha
 
 
-def finish_scan(*, passed, sha, log_kwargs, resolved_count=None, total_count=None):
+def finish_scan(
+    *,
+    passed,
+    sha,
+    log_kwargs,
+    resolved_count=None,
+    total_count=None,
+    check_description=None,
+):
+    if check_description is None:
+        check_description = (
+            "No target security findings detected."
+            if passed
+            else "Security scan failed."
+        )
+    post_security_scan_check(sha, passed=passed, description=check_description)
+
     if passed:
         post_pass_review(sha, resolved_count, total_count)
         if resolved_count is not None and total_count is not None and total_count > 0:
@@ -594,6 +647,11 @@ def main():
             initial_findings=remaining,
             devin_attempted=True,
         )
+        post_security_scan_check(
+            latest_sha,
+            passed=False,
+            description=f"{len(remaining)} finding(s) remain after remediation.",
+        )
         sys.exit(1)
 
     original_keys = {finding_key(f) for f in findings}
@@ -633,7 +691,14 @@ def main():
 
     if remaining:
         post_remediation_failed_review(original_keys, remaining, final_sha)
-        finish_scan(passed=False, sha=final_sha, log_kwargs=log_kwargs)
+        finish_scan(
+            passed=False,
+            sha=final_sha,
+            log_kwargs=log_kwargs,
+            check_description=(
+                f"{len(remaining)} finding(s) remain after Devin remediation."
+            ),
+        )
 
     resolved_count = total - len(remaining)
     finish_scan(
@@ -642,6 +707,7 @@ def main():
         log_kwargs=log_kwargs,
         resolved_count=resolved_count,
         total_count=total,
+        check_description=remediation_success_summary(resolved_count, total),
     )
 
 
